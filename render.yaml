@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: pdf-sku-label-tool
+    env: python
+    pythonVersion: 3.12
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn web_app:app
