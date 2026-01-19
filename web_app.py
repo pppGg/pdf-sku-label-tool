@@ -1,3 +1,20 @@
+import sys
+
+print("PYTHON VERSION:", sys.version)
+
+try:
+    import fitz  # PyMuPDF
+    print("PyMuPDF version:", fitz.__doc__)
+except Exception as e:
+    print("PyMuPDF import error:", e)
+
+try:
+    import pdfplumber
+    print("pdfplumber version:", pdfplumber.__version__)
+except Exception as e:
+    print("pdfplumber import error:", e)
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
