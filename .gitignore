@@ -28,5 +28,5 @@ Thumbs.db
 .env
 .env.local
 
-# 处理历史记录（每个环境独立）
-processing_history.json
+# 历史记录
+history.json
