@@ -10,9 +10,46 @@ import fitz  # PyMuPDF
 import re
 import gc
 import os
+import sys
 import tempfile
 
 from typing import List, Tuple, Dict
+
+
+def get_memory_mb():
+    """获取当前进程内存使用量(MB)"""
+    try:
+        # Linux系统：读取/proc/self/status
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    # VmRSS是实际使用的物理内存
+                    return int(line.split()[1]) / 1024  # KB转MB
+    except:
+        pass
+    
+    try:
+        # 备用方案：使用resource模块
+        import resource
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        # macOS返回字节，Linux返回KB
+        if sys.platform == 'darwin':
+            return usage.ru_maxrss / 1024 / 1024  # 字节转MB
+        else:
+            return usage.ru_maxrss / 1024  # KB转MB
+    except:
+        pass
+    
+    return 0
+
+
+def log_memory(msg: str):
+    """打印带内存信息的日志"""
+    mem = get_memory_mb()
+    if mem > 0:
+        print(f"[{mem:.1f}MB] {msg}", flush=True)
+    else:
+        print(msg, flush=True)
 
 # ========== 表格位置配置 ==========
 # 手动设置表格的Y坐标（表格顶部位置）
@@ -371,34 +408,43 @@ def process_pdf(input_path: str, output_path: str):
     - 分步骤处理，避免同时打开多个大对象
     - 使用临时文件减少内存占用
     - 定期强制垃圾回收
+    - 实时内存监控
     """
-    print(f"正在处理PDF文件: {input_path}")
+    log_memory(f"开始处理: {input_path}")
     
     # 第一步：获取总页数
     with fitz.open(input_path) as doc:
         total_pages = len(doc)
-    print(f"PDF共 {total_pages} 页")
+    log_memory(f"PDF共 {total_pages} 页, {total_pages // 2} 个面单")
     
-    # 第二步：提取所有SKU数据（只使用pdfplumber，然后关闭）
+    # 第二步：分批提取SKU数据（避免pdfplumber一次加载太多页面）
     packing_slip_data = {}
-    with pdfplumber.open(input_path) as pdf:
-        for page_num in range(len(pdf.pages)):
-            if page_num % 2 == 1:  # 拣货单页面
-                page = pdf.pages[page_num]
-                text = page.extract_text()
-                if text:
-                    skus = extract_sku_from_packing_slip(text)
-                    if skus:
-                        shipping_label_page = page_num - 1
-                        packing_slip_data[shipping_label_page] = skus
-                        print(f"  页面 {page_num + 1} 提取到 {len(skus)} 个SKU")
+    log_memory("开始提取SKU...")
     
-    # 强制释放pdfplumber内存
-    gc.collect()
+    # 每次只打开PDF提取一部分页面的SKU，然后关闭释放内存
+    EXTRACT_BATCH = 20  # 每次提取20页的SKU
+    for batch_start in range(0, total_pages, EXTRACT_BATCH):
+        batch_end = min(batch_start + EXTRACT_BATCH, total_pages)
+        
+        with pdfplumber.open(input_path) as pdf:
+            for page_num in range(batch_start, batch_end):
+                if page_num % 2 == 1:  # 拣货单页面
+                    page = pdf.pages[page_num]
+                    text = page.extract_text()
+                    if text:
+                        skus = extract_sku_from_packing_slip(text)
+                        if skus:
+                            shipping_label_page = page_num - 1
+                            packing_slip_data[shipping_label_page] = skus
+        
+        # 每批提取后强制GC
+        gc.collect()
+    
+    log_memory(f"SKU提取完成, 共 {len(packing_slip_data)} 个面单有SKU")
     
     # 第三步：处理并输出（使用临时文件分批处理）
-    # 每批处理的面单数量
-    BATCH_SIZE = 20  # 每批20个面单（40页）
+    # 每批处理的面单数量 - 减小批次大小以降低内存峰值
+    BATCH_SIZE = 5  # 每批5个面单（极低内存模式）
     
     temp_files = []
     shipping_label_count = 0
@@ -407,6 +453,8 @@ def process_pdf(input_path: str, output_path: str):
         # 分批处理
         label_pages = [p for p in range(total_pages) if p % 2 == 0]  # 所有面单页码
         num_batches = (len(label_pages) + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        log_memory(f"分 {num_batches} 批处理, 每批 {BATCH_SIZE} 个面单")
         
         for batch_idx in range(num_batches):
             start_idx = batch_idx * BATCH_SIZE
@@ -437,17 +485,29 @@ def process_pdf(input_path: str, output_path: str):
             doc.close()
             gc.collect()
             
-            print(f"  批次 {batch_idx + 1}/{num_batches} 完成 ({len(batch_pages)} 个面单)")
+            log_memory(f"批次 {batch_idx + 1}/{num_batches} 完成 ({len(batch_pages)} 个)")
         
-        # 合并所有临时文件
-        print("正在合并输出文件...")
+        # 合并所有临时文件 - 逐个合并并立即删除以节省内存和磁盘
+        log_memory("开始合并输出文件...")
         output_doc = fitz.open()
-        for temp_file in temp_files:
+        for i, temp_file in enumerate(temp_files):
             temp_pdf = fitz.open(temp_file)
             output_doc.insert_pdf(temp_pdf)
             temp_pdf.close()
-            gc.collect()
+            # 合并后立即删除临时文件释放磁盘空间
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
+            # 每合并2个就gc一次
+            if (i + 1) % 2 == 0:
+                gc.collect()
+                log_memory(f"已合并 {i + 1}/{len(temp_files)} 批")
         
+        # 清空临时文件列表（已删除）
+        temp_files = []
+        
+        log_memory("保存最终文件...")
         output_doc.save(output_path, garbage=4, deflate=True)
         output_doc.close()
         
@@ -460,8 +520,7 @@ def process_pdf(input_path: str, output_path: str):
                 pass
         gc.collect()
     
-    print(f"处理完成，输出文件: {output_path}")
-    print(f"输出文件包含 {shipping_label_count} 个物流面单页面")
+    log_memory(f"处理完成! 输出 {shipping_label_count} 个面单")
     
     return shipping_label_count
 
