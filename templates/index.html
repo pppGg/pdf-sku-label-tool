@@ -198,6 +198,16 @@
         .instructions li {
             margin-bottom: 8px;
         }
+        
+        .history-info {
+            position: fixed;
+            bottom: 10px;
+            right: 10px;
+            font-size: 11px;
+            color: rgba(255, 255, 255, 0.6);
+            text-align: right;
+            line-height: 1.5;
+        }
     </style>
 </head>
 <body>
@@ -306,5 +316,12 @@
             loading.style.display = 'block';
         });
     </script>
+    
+    <!-- 历史记录显示 -->
+    {% if history %}
+    <div class="history-info">
+        历史最大: {{ history.get('max_file_size_mb', 0) }}MB / {{ history.get('max_pages', 0) }}页
+    </div>
+    {% endif %}
 </body>
 </html>

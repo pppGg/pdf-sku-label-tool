@@ -2,14 +2,29 @@
 # -*- coding: utf-8 -*-
 """
 处理PDF文件：从拣货单提取SKU信息并插入到物流面单
+
+优化版本 v0.9.1 - 针对低内存环境（512MB RAM）进行优化：
+- 分批处理PDF页面，减少内存占用
+- 及时释放资源和垃圾回收
+- 增量式输出
 """
 
 import os
 import re
-from typing import List, Tuple, Dict, Set
+import gc
+import tempfile
+from typing import List, Tuple, Dict, Set, Optional
 
 import pdfplumber
 import fitz  # PyMuPDF
+
+# ========== 内存优化配置 ==========
+# 每批处理的页面对数（1对 = 1个面单 + 1个拣货单）
+# 在512MB内存环境下，建议设置为 5-10
+BATCH_SIZE = 5
+
+# 是否启用内存优化模式（强制垃圾回收等）
+MEMORY_OPTIMIZE = True
 
 
 # ========== 表格位置配置 ==========
@@ -838,56 +853,230 @@ def create_sku_table(doc: fitz.Document, page_num: int, skus: List[Tuple[str, in
                         pass
 
 
+def _force_gc():
+    """强制垃圾回收以释放内存"""
+    if MEMORY_OPTIMIZE:
+        gc.collect()
+
+
+def _extract_skus_from_batch(input_path: str, start_page: int, end_page: int) -> Dict[int, List[Tuple[str, int]]]:
+    """
+    从PDF的指定页面范围提取SKU信息
+    
+    Args:
+        input_path: PDF文件路径
+        start_page: 起始页码（包含）
+        end_page: 结束页码（不包含）
+    
+    Returns:
+        字典 {物流面单页码: SKU列表}
+    """
+    packing_slip_data = {}
+    
+    with pdfplumber.open(input_path) as pdf:
+        total_pages = len(pdf.pages)
+        actual_end = min(end_page, total_pages)
+        
+        for page_num in range(start_page, actual_end):
+            # 偶数页（索引从0开始，所以1, 3, 5...）是拣货单
+            if page_num % 2 == 1:
+                page = pdf.pages[page_num]
+                skus = extract_sku_from_page(page)
+                if skus:
+                    shipping_label_page = page_num - 1
+                    packing_slip_data[shipping_label_page] = skus
+                    print(f"  页面 {page_num + 1} (拣货单) 提取到 {len(skus)} 个SKU")
+    
+    return packing_slip_data
+
+
+def _process_batch_pages(input_path: str, output_doc: fitz.Document, 
+                         start_page: int, end_page: int, 
+                         packing_slip_data: Dict[int, List[Tuple[str, int]]]) -> int:
+    """
+    处理一批页面：添加SKU表格并复制物流面单到输出文档
+    
+    Args:
+        input_path: 输入PDF路径
+        output_doc: 输出文档对象
+        start_page: 起始页码
+        end_page: 结束页码
+        packing_slip_data: SKU数据
+    
+    Returns:
+        处理的物流面单数量
+    """
+    count = 0
+    
+    # 打开源文档处理这一批
+    doc = fitz.open(input_path)
+    
+    try:
+        for page_num in range(start_page, min(end_page, len(doc))):
+            # 只处理物流面单页面（偶数索引：0, 2, 4...）
+            if page_num % 2 == 0:
+                # 如果有对应的SKU数据，先添加表格
+                if page_num in packing_slip_data:
+                    create_sku_table(doc, page_num, packing_slip_data[page_num])
+                
+                # 复制页面到输出文档
+                output_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
+                count += 1
+    finally:
+        doc.close()
+    
+    return count
+
+
 def process_pdf(input_path: str, output_path: str):
     """
     处理PDF文件：提取SKU信息并插入到物流面单
     只输出物流面单页面，不包含拣货单
+    
+    内存优化版本：分批处理页面，减少内存占用
     """
     print(f"正在处理PDF文件: {input_path}")
     
-    # 使用PyMuPDF打开PDF
-    doc = fitz.open(input_path)
+    # 首先获取PDF总页数
+    with fitz.open(input_path) as doc:
+        total_pages = len(doc)
     
-    # 使用pdfplumber提取文本
-    packing_slip_data = {}
+    print(f"PDF共 {total_pages} 页，约 {total_pages // 2} 个物流面单")
     
-    with pdfplumber.open(input_path) as pdf:
-        for page_num in range(len(pdf.pages)):
-            # 偶数页（索引从0开始，所以1, 3, 5...）是拣货单
-            if page_num % 2 == 1:
-                page = pdf.pages[page_num]
-                # 优先使用基于坐标的解析，以 Seller~Qty 区域为准识别 SKU
-                skus = extract_sku_from_page(page)
-                if skus:
-                    # 对应的物流面单是前一页（奇数页，索引从0开始，所以0, 2, 4...）
-                    shipping_label_page = page_num - 1
-                    packing_slip_data[shipping_label_page] = skus
-                    print(f"页面 {page_num + 1} (拣货单) 提取到 {len(skus)} 个SKU: {skus}")
-                    print(f"  将插入到页面 {shipping_label_page + 1} (物流面单)")
+    # 计算批次
+    # 每对页面 = 1个面单 + 1个拣货单，所以每批处理 BATCH_SIZE * 2 页
+    batch_page_size = BATCH_SIZE * 2
+    num_batches = (total_pages + batch_page_size - 1) // batch_page_size
     
-    # 在物流面单上添加表格
-    for shipping_label_page, skus in packing_slip_data.items():
-        print(f"\n在页面 {shipping_label_page + 1} 上创建表格...")
-        create_sku_table(doc, shipping_label_page, skus)
+    print(f"将分 {num_batches} 批处理，每批 {BATCH_SIZE} 对页面")
     
-    # 创建新的PDF文档，只包含物流面单页面（奇数页）
+    # 创建输出文档
     output_doc = fitz.open()
-    
     shipping_label_count = 0
-    for page_num in range(len(doc)):
-        # 只保留奇数页（索引从0开始，所以0, 2, 4...是物流面单）
-        if page_num % 2 == 0:
-            # 复制页面到新文档
-            output_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
-            shipping_label_count += 1
     
-    # 保存输出文件
-    output_doc.save(output_path)
-    output_doc.close()
-    doc.close()
+    try:
+        for batch_idx in range(num_batches):
+            start_page = batch_idx * batch_page_size
+            end_page = min(start_page + batch_page_size, total_pages)
+            
+            print(f"\n--- 处理批次 {batch_idx + 1}/{num_batches} (页面 {start_page + 1}-{end_page}) ---")
+            
+            # 步骤1：提取这一批的SKU数据
+            packing_slip_data = _extract_skus_from_batch(input_path, start_page, end_page)
+            _force_gc()
+            
+            # 步骤2：处理这一批的页面（添加表格并复制到输出）
+            count = _process_batch_pages(input_path, output_doc, start_page, end_page, packing_slip_data)
+            shipping_label_count += count
+            
+            print(f"  本批次处理了 {count} 个物流面单")
+            
+            # 清理这一批的数据
+            packing_slip_data.clear()
+            _force_gc()
+        
+        # 保存输出文件
+        print(f"\n正在保存输出文件...")
+        output_doc.save(output_path, garbage=4, deflate=True)  # 压缩输出以减少文件大小
+        
+    finally:
+        output_doc.close()
+        _force_gc()
     
     print(f"\n处理完成，输出文件: {output_path}")
     print(f"输出文件包含 {shipping_label_count} 个物流面单页面（已移除拣货单）")
+    
+    return shipping_label_count
+
+
+def process_pdf_streaming(input_path: str, output_path: str):
+    """
+    流式处理PDF文件 - 极低内存模式
+    适用于超大PDF或极低内存环境
+    
+    Args:
+        input_path: 输入文件路径
+        output_path: 输出文件路径
+    
+    Returns:
+        处理的物流面单数量
+    """
+    print(f"[流式模式] 正在处理PDF文件: {input_path}")
+    
+    # 获取总页数
+    with fitz.open(input_path) as doc:
+        total_pages = len(doc)
+    
+    print(f"PDF共 {total_pages} 页")
+    
+    # 使用临时文件逐步构建输出
+    temp_files = []
+    shipping_label_count = 0
+    
+    try:
+        # 每次只处理2页（1对）
+        for pair_idx in range(0, total_pages, 2):
+            label_page = pair_idx
+            slip_page = pair_idx + 1
+            
+            if slip_page >= total_pages:
+                break
+            
+            # 提取SKU
+            skus = []
+            with pdfplumber.open(input_path) as pdf:
+                if slip_page < len(pdf.pages):
+                    skus = extract_sku_from_page(pdf.pages[slip_page])
+            _force_gc()
+            
+            # 处理物流面单页面
+            with fitz.open(input_path) as doc:
+                if label_page < len(doc):
+                    # 创建临时单页PDF
+                    temp_doc = fitz.open()
+                    temp_doc.insert_pdf(doc, from_page=label_page, to_page=label_page)
+                    
+                    # 添加SKU表格
+                    if skus:
+                        create_sku_table(temp_doc, 0, skus)
+                    
+                    # 保存临时文件
+                    temp_file = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+                    temp_doc.save(temp_file.name)
+                    temp_doc.close()
+                    temp_files.append(temp_file.name)
+                    shipping_label_count += 1
+            
+            _force_gc()
+            
+            if (pair_idx // 2 + 1) % 10 == 0:
+                print(f"  已处理 {pair_idx // 2 + 1} 个物流面单...")
+        
+        # 合并所有临时文件
+        print(f"\n正在合并 {len(temp_files)} 个页面...")
+        output_doc = fitz.open()
+        
+        for temp_file in temp_files:
+            with fitz.open(temp_file) as temp_pdf:
+                output_doc.insert_pdf(temp_pdf)
+            _force_gc()
+        
+        output_doc.save(output_path, garbage=4, deflate=True)
+        output_doc.close()
+        
+    finally:
+        # 清理临时文件
+        for temp_file in temp_files:
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
+        _force_gc()
+    
+    print(f"\n处理完成，输出文件: {output_path}")
+    print(f"输出文件包含 {shipping_label_count} 个物流面单页面")
+    
+    return shipping_label_count
 
 
 if __name__ == "__main__":
