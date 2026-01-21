@@ -201,12 +201,10 @@
         
         .history-info {
             position: fixed;
-            bottom: 10px;
-            right: 10px;
+            bottom: 8px;
+            right: 12px;
             font-size: 11px;
-            color: rgba(255, 255, 255, 0.6);
-            text-align: right;
-            line-height: 1.5;
+            color: rgba(255, 255, 255, 0.5);
         }
     </style>
 </head>
@@ -317,10 +315,9 @@
         });
     </script>
     
-    <!-- 历史记录显示 -->
     {% if history %}
     <div class="history-info">
-        历史最大: {{ history.get('max_file_size_mb', 0) }}MB / {{ history.get('max_pages', 0) }}页
+        历史最大: {{ history.max_file_mb }}MB / {{ history.max_pages }}页
     </div>
     {% endif %}
 </body>
